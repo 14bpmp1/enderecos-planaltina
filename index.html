@@ -1285,6 +1285,23 @@ function criarCard(item) {
     acoes.appendChild(waze);
   }
 
+  /* COMPARTILHAR ENDEREÇO */
+
+  const compartilhar = document.createElement("button");
+  compartilhar.className = "action-link waze";
+  compartilhar.type = "button";
+  compartilhar.textContent = "Compartilhar";
+  compartilhar.setAttribute("aria-label", `Compartilhar endereço: ${enderecoCompleto}`);
+  compartilhar.onclick = async () => {
+    compartilhar.disabled = true;
+    try {
+      await compartilharEndereco(enderecoCompleto, item.coordenadas, maps.href);
+    } finally {
+      compartilhar.disabled = false;
+    }
+  };
+  acoes.appendChild(compartilhar);
+
   /* COPIAR ENDEREÇO */
 
   const copiar = document.createElement("button");
@@ -1374,10 +1391,26 @@ function mostrarAviso(mensagem) {
   }, 2200);
 }
 
-async function copiarTexto(texto) {
+async function compartilharEndereco(endereco, coordenadas, url) {
+  const texto = endereco + (coordenadas ? `\nGPS: ${coordenadas}` : "");
+
+  if (typeof navigator.share === "function") {
+    try {
+      await navigator.share({ title: "Endereço em Planaltina DF", text: texto, url });
+      return;
+    } catch (erro) {
+      // Fechar o menu de compartilhamento não deve copiar conteúdo sem solicitação.
+      if (erro.name === "AbortError") return;
+    }
+  }
+
+  await copiarTexto(`${texto}\n${url}`, "Endereço e link copiados para compartilhar!");
+}
+
+async function copiarTexto(texto, mensagem = "Endereço copiado!") {
   try {
     await navigator.clipboard.writeText(texto);
-    mostrarAviso("Endereço copiado!");
+    mostrarAviso(mensagem);
   } catch (erro) {
     mostrarAviso("Não foi possível copiar.");
   }
