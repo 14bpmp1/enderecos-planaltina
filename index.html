@@ -241,7 +241,7 @@ main {
 
 .filters {
   display: grid;
-  grid-template-columns: 1fr 220px;
+  grid-template-columns: minmax(0, 1fr) 180px 180px;
   gap: 9px;
 }
 
@@ -467,6 +467,22 @@ footer {
   font-size: 12px;
 }
 
+.data-status {
+  margin-bottom: 14px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--card);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.data-status button { margin-top: 8px; }
+.theme-button, .copy-button { width: 44px; height: 44px; }
+.action-link, .tool-button, .reset-button, .back-button { min-height: 44px; }
+.actions { flex-wrap: wrap; }
+.results.list .actions { max-width: 300px; }
+
 /* TABLETS */
 
 @media (max-width: 850px) {
@@ -568,18 +584,9 @@ footer {
     font-size: 11px;
   }
 
-  .copy-button {
-    width: 34px;
-    height: 34px;
-  }
-
-  .results.list .action-text {
-    display: none;
-  }
-
-  .results.list .action-link {
-    padding: 7px;
-  }
+  .results.list .card { display: flex; align-items: stretch; }
+  .results.list .actions { max-width: none; padding-top: 4px; }
+  .action-link { min-height: 44px; }
 
   .tools {
     gap: 4px;
@@ -620,6 +627,11 @@ footer {
 </header>
 
 <main>
+
+  <aside id="dataStatus" class="data-status" aria-label="Atualização dos endereços">
+    <div id="dataMessage" role="status">Carregando endereços da planilha...</div>
+    <button id="retryButton" class="tool-button" type="button" hidden>Tentar novamente</button>
+  </aside>
 
   <!-- TELA 1: ESCOLHA DAS REGIÕES -->
 
@@ -682,12 +694,16 @@ footer {
           </option>
         </select>
 
+        <select id="conjuntoSelect" aria-label="Selecionar conjunto">
+          <option value="">Todos os conjuntos</option>
+        </select>
+
       </div>
     </section>
 
     <section class="summary">
       <div>
-        <div id="resultCount" class="count">
+        <div id="resultCount" class="count" role="status" aria-atomic="true">
           Carregando...
         </div>
 
@@ -764,10 +780,15 @@ const API_URL =
 let enderecos = [];
 let regiaoAtual = "";
 let quadraAtual = "";
+let conjuntoAtual = "";
 let pesquisaAtual = "";
 let limite = 40;
 let modoLista = false;
 let dadosCarregados = false;
+let carregando = false;
+let sequenciaCarga = 0;
+const CACHE_KEY = "planaltina-enderecos-v1";
+const contextosRegiao = new Map();
 
 const el = id => document.getElementById(id);
 
@@ -830,19 +851,26 @@ function interpretarCoordenadas(valor) {
 ========================================== */
 
 function converterLinha(linha) {
+  if (!linha || typeof linha !== "object" || Array.isArray(linha)) return null;
+
   const regiao = String(
     linha.__aba ||
     obterCampo(linha, /^regiao/)
   ).trim();
 
   const bairro =
-    obterCampo(linha, /^regiao/) ||
+    obterCampo(linha, /^bairro/) || obterCampo(linha, /^regiao/) ||
     regiao;
 
   const coordenadas = interpretarCoordenadas(
     obterCampo(linha, /^coordenadas/) ||
-    obterCampo(linha, /^latitude.*longitude/)
+    obterCampo(linha, /^latitude.*longitude/) ||
+    [obterCampo(linha, /^(latitude|lat)$/),
+      obterCampo(linha, /^(longitude|lng|lon)$/)].join(";")
   );
+
+  const quadra = obterCampo(linha, /^(quadra|qd\.?|q\.?)$/);
+  const conjunto = obterCampo(linha, /^(conjunto|conj\.?|cj\.?)$/);
 
   const partes = Object.entries(linha)
     .filter(([chave, valor]) => {
@@ -851,14 +879,29 @@ function converterLinha(linha) {
       return (
         chave !== "__aba" &&
         String(valor ?? "").trim() !== "" &&
-        !/^(regiao|coordenadas|link|tracar rota)/.test(nome)
+        !/^(regiao|bairro|coordenadas|latitude|longitude|link|tracar rota)/.test(nome) &&
+        !/^(lat|lng|lon)$/.test(nome)
       );
     })
-    .map(([, valor]) => String(valor).trim());
+    .map(([chave, valor]) => {
+      const nome = normalizar(chave);
+      const texto = String(valor).trim();
+      if (/^(quadra|qd\.?|q\.?)$/.test(nome)) {
+        return /^(quadra|qd?\.?|q)\s*/i.test(texto) ? texto : `Quadra ${texto}`;
+      }
+      if (/^(conjunto|conj\.?|cj\.?)$/.test(nome)) {
+        return /^(conjunto|conj\.?|cj\.?)\s*/i.test(texto) ? texto : `Conjunto ${texto}`;
+      }
+      return texto;
+    });
+
+  if (!regiao || !partes.length) return null;
 
   return {
     regiao,
     bairro,
+    quadra: canonizarIdentificador(quadra, "Quadra"),
+    conjunto: canonizarIdentificador(conjunto, "Conjunto"),
     titulo: partes.join(" · ") || bairro,
     coordenadas
   };
@@ -869,6 +912,7 @@ function converterLinha(linha) {
 ========================================== */
 
 function identificarQuadra(item) {
+  if (item.quadra) return item.quadra;
   const texto = item.titulo || "";
 
   const resultado = texto.match(
@@ -876,11 +920,32 @@ function identificarQuadra(item) {
   );
 
   if (resultado) {
-    return "Quadra " +
-      resultado[1].toUpperCase();
+    return canonizarIdentificador(resultado[1], "Quadra");
   }
 
   return "";
+}
+
+function canonizarIdentificador(valor, tipo) {
+  const prefixo = tipo === "Quadra"
+    ? /^(?:quadra|qd?|q)(?:\s+|\.\s*|(?=\d))/i
+    : /^(?:conjunto|conj|cj)(?:\s+|\.\s*|(?=\d))/i;
+  const texto = String(valor || "").trim().replace(prefixo, "").trim().toUpperCase();
+  if (!texto) return "";
+  return tipo + " " + texto.replace(/^0+(?=\d)/, "");
+}
+
+function identificarConjunto(item) {
+  if (item.conjunto) return item.conjunto;
+  const resultado = item.titulo.match(/(?:^|[^\p{L}])(?:conjunto\s+|(?:conj|cj)(?:\.\s*|\s+|(?=\d)))([\p{L}\d]+)(?=$|[^\p{L}\d])/iu);
+  return resultado ? canonizarIdentificador(resultado[1], "Conjunto") : "";
+}
+
+function textoPesquisa(valor) {
+  return normalizar(valor)
+    .replace(/\b(?:qd?|quadra)\.?\s*(?=\d)/g, "quadra ")
+    .replace(/\b(?:conj|cj|conjunto)\.?\s*(?=[a-z0-9])/g, "conjunto ")
+    .replace(/\d+/g, numero => String(Number(numero)));
 }
 
 /* ==========================================
@@ -910,7 +975,8 @@ function mostrarRegioes() {
   }
 
   el("homeStatus").textContent =
-    `${regioes.length} regiões disponíveis`;
+    `${regioes.length} regiões disponíveis · ${enderecos.length.toLocaleString("pt-BR")} endereços · ` +
+    `${enderecos.filter(item => item.coordenadas).length.toLocaleString("pt-BR")} com GPS`;
 
   regioes.forEach(nome => {
     const quantidade = enderecos.filter(
@@ -952,26 +1018,38 @@ function mostrarRegioes() {
 ========================================== */
 
 function abrirRegiao(nome) {
+  salvarPosicao();
+  const contexto = contextosRegiao.get(nome);
   regiaoAtual = nome;
-  quadraAtual = "";
-  pesquisaAtual = "";
-  limite = 40;
+  quadraAtual = contexto?.quadra || "";
+  conjuntoAtual = contexto?.conjunto || "";
+  pesquisaAtual = contexto?.pesquisa || "";
+  limite = contexto?.limite || 40;
 
-  el("searchInput").value = "";
+  el("searchInput").value = pesquisaAtual;
   el("selectedRegion").textContent = nome;
 
   atualizarQuadras();
+  atualizarConjuntos();
   mostrarResultados();
 
   el("homePage").hidden = true;
   el("addressesPage").hidden = false;
-
-  window.scrollTo(0, 0);
+  atualizarURL();
+  el("selectedRegion").tabIndex = -1;
+  el("selectedRegion").focus({ preventScroll: true });
+  window.scrollTo(0, contexto?.scroll || 0);
 }
 
 function voltarRegioes() {
+  contextosRegiao.set(regiaoAtual, {
+    quadra: quadraAtual, conjunto: conjuntoAtual, pesquisa: pesquisaAtual,
+    limite, scroll: window.scrollY
+  });
+  salvarPosicao();
   regiaoAtual = "";
   quadraAtual = "";
+  conjuntoAtual = "";
   pesquisaAtual = "";
   limite = 40;
 
@@ -979,11 +1057,54 @@ function voltarRegioes() {
 
   el("addressesPage").hidden = true;
   el("homePage").hidden = false;
-
+  atualizarURL();
+  el("homePage").querySelector("h2").tabIndex = -1;
+  el("homePage").querySelector("h2").focus({ preventScroll: true });
   window.scrollTo(0, 0);
 }
 
 el("backButton").onclick = voltarRegioes;
+
+function salvarPosicao() {
+  history.replaceState({ scroll: window.scrollY, limite }, "");
+}
+
+function atualizarURL(substituir = false) {
+  const parametros = new URLSearchParams();
+  if (regiaoAtual) parametros.set("regiao", regiaoAtual);
+  if (quadraAtual) parametros.set("quadra", quadraAtual);
+  if (conjuntoAtual) parametros.set("conjunto", conjuntoAtual);
+  if (pesquisaAtual) parametros.set("busca", pesquisaAtual);
+  const hash = parametros.toString();
+  history[substituir ? "replaceState" : "pushState"](
+    { scroll: 0, limite }, "", location.pathname + location.search + (hash ? "#" + hash : "")
+  );
+}
+
+function restaurarNavegacao() {
+  if (!dadosCarregados) return;
+  const parametros = new URLSearchParams(location.hash.slice(1));
+  const nome = parametros.get("regiao") || "";
+  regiaoAtual = enderecos.some(item => item.regiao === nome) ? nome : "";
+  quadraAtual = parametros.get("quadra") || "";
+  conjuntoAtual = parametros.get("conjunto") || "";
+  pesquisaAtual = parametros.get("busca") || "";
+  limite = history.state?.limite || 40;
+  el("searchInput").value = pesquisaAtual;
+  el("selectedRegion").textContent = regiaoAtual;
+  el("homePage").hidden = Boolean(regiaoAtual);
+  el("addressesPage").hidden = !regiaoAtual;
+  if (regiaoAtual) {
+    atualizarQuadras();
+    atualizarConjuntos();
+    mostrarResultados();
+  }
+  requestAnimationFrame(() => window.scrollTo(0, history.state?.scroll || 0));
+}
+
+window.addEventListener("popstate", restaurarNavegacao);
+window.addEventListener("hashchange", restaurarNavegacao);
+window.addEventListener("pagehide", salvarPosicao);
 
 /* ==========================================
    FILTRO DE QUADRAS
@@ -1022,14 +1143,25 @@ function atualizarQuadras() {
   select.value = quadraAtual;
 }
 
+function atualizarConjuntos() {
+  const conjuntos = [...new Set(enderecos
+    .filter(item => item.regiao === regiaoAtual &&
+      (!quadraAtual || identificarQuadra(item) === quadraAtual))
+    .map(identificarConjunto).filter(Boolean))]
+    .sort((a, b) => a.localeCompare(b, "pt-BR", { numeric: true }));
+  const select = el("conjuntoSelect");
+  select.replaceChildren(new Option("Todos os conjuntos", ""));
+  conjuntos.forEach(conjunto => select.appendChild(new Option(conjunto, conjunto)));
+  if (!conjuntos.includes(conjuntoAtual)) conjuntoAtual = "";
+  select.value = conjuntoAtual;
+}
+
 /* ==========================================
    PESQUISA
 ========================================== */
 
 function obterResultados() {
-  const palavras = normalizar(pesquisaAtual)
-    .split(/\s+/)
-    .filter(Boolean);
+  const palavras = textoPesquisa(pesquisaAtual).match(/[\p{L}\d]+/gu) || [];
 
   return enderecos.filter(item => {
     if (item.regiao !== regiaoAtual) {
@@ -1043,15 +1175,18 @@ function obterResultados() {
       return false;
     }
 
-    const texto = normalizar([
+    if (conjuntoAtual && identificarConjunto(item) !== conjuntoAtual) return false;
+
+    const texto = textoPesquisa([
       item.regiao,
       item.bairro,
       item.titulo
     ].join(" "));
 
-    return palavras.every(palavra =>
-      texto.includes(palavra)
-    );
+    const tokens = texto.match(/[\p{L}\d]+/gu) || [];
+    return palavras.every(palavra => /\d/.test(palavra)
+      ? tokens.includes(palavra)
+      : tokens.some(token => token.startsWith(palavra)));
   });
 }
 
@@ -1125,6 +1260,7 @@ function criarCard(item) {
   }
 
   maps.append("⌖ ", textoMaps);
+  maps.setAttribute("aria-label", `${textoMaps.textContent}: ${enderecoCompleto}`);
   acoes.appendChild(maps);
 
   /* WAZE */
@@ -1145,6 +1281,7 @@ function criarCard(item) {
     textoWaze.textContent = "Waze";
 
     waze.append("↗ ", textoWaze);
+    waze.setAttribute("aria-label", `Abrir no Waze: ${enderecoCompleto}`);
     acoes.appendChild(waze);
   }
 
@@ -1193,7 +1330,7 @@ function mostrarResultados() {
 
   el("resultCount").textContent =
     resultados.length.toLocaleString("pt-BR") +
-    " endereços encontrados";
+    (resultados.length === 1 ? " endereço encontrado" : " endereços encontrados");
 
   if (resultados.length === 0) {
     const vazio = document.createElement("div");
@@ -1255,6 +1392,7 @@ el("searchInput").addEventListener(
   evento => {
     pesquisaAtual = evento.target.value;
     limite = 40;
+    atualizarURL(true);
     mostrarResultados();
   }
 );
@@ -1263,24 +1401,38 @@ el("quadraSelect").addEventListener(
   "change",
   evento => {
     quadraAtual = evento.target.value;
+    conjuntoAtual = "";
     limite = 40;
+    atualizarConjuntos();
+    atualizarURL(true);
     mostrarResultados();
   }
 );
 
+el("conjuntoSelect").addEventListener("change", evento => {
+  conjuntoAtual = evento.target.value;
+  limite = 40;
+  atualizarURL(true);
+  mostrarResultados();
+});
+
 el("resetButton").onclick = () => {
   quadraAtual = "";
+  conjuntoAtual = "";
   pesquisaAtual = "";
   limite = 40;
 
   el("searchInput").value = "";
 
   atualizarQuadras();
+  atualizarConjuntos();
+  atualizarURL(true);
   mostrarResultados();
 };
 
 el("moreButton").onclick = () => {
   limite += 40;
+  atualizarURL(true);
   mostrarResultados();
 };
 
@@ -1289,6 +1441,7 @@ el("viewButton").onclick = () => {
 
   el("viewButton").textContent =
     modoLista ? "▦ Cards" : "☷ Lista";
+  el("viewButton").setAttribute("aria-pressed", String(modoLista));
 
   mostrarResultados();
 };
@@ -1357,7 +1510,13 @@ el("themeButton").onclick = () => {
 ========================================== */
 
 function carregarEnderecos() {
-  const callback = "receberEnderecosPlanaltina";
+  if (carregando) return;
+  carregando = true;
+  el("retryButton").disabled = true;
+  definirStatus(dadosCarregados
+    ? `Consultando a planilha. Exibindo a base recebida em ${formatarData(dataBase)}.`
+    : "Carregando endereços da planilha...");
+  const callback = "receberEnderecosPlanaltina" + (++sequenciaCarga);
   const script = document.createElement("script");
 
   let concluido = false;
@@ -1370,23 +1529,29 @@ function carregarEnderecos() {
     if (concluido) return;
 
     concluido = true;
+    carregando = false;
     clearTimeout(timeout);
     script.remove();
+    el("retryButton").hidden = false;
+    el("retryButton").disabled = false;
+    el("retryButton").textContent = sucesso ? "Atualizar planilha" : "Tentar novamente";
 
     try {
       delete window[callback];
     } catch (erro) {}
 
     if (!sucesso) {
-      const mensagem =
-        "Não foi possível carregar o Google Sheets.";
-
-      el("homeStatus").textContent = mensagem;
-      el("sourceStatus").textContent = mensagem;
+      const mensagem = dadosCarregados
+        ? "Não foi possível atualizar a planilha. Exibindo a última base disponível" +
+          (dataBase ? `, recebida em ${formatarData(dataBase)}` : "") + "."
+        : "Não foi possível carregar os endereços. Verifique sua conexão e tente novamente.";
+      definirStatus(mensagem);
+      if (!dadosCarregados) el("homeStatus").textContent = "Nenhuma base disponível para consulta.";
     }
   }
 
   window[callback] = resposta => {
+    if (concluido) return;
     if (
       !resposta ||
       resposta.ok !== true ||
@@ -1396,29 +1561,37 @@ function carregarEnderecos() {
       return;
     }
 
-    const dados = resposta.registros
-      .map(converterLinha)
-      .filter(item =>
-        item.regiao && item.titulo
-      );
+    let dados;
+    try {
+      dados = resposta.registros.map(converterLinha).filter(Boolean);
+    } catch (erro) {
+      finalizar(false);
+      return;
+    }
 
     if (!dados.length) {
       finalizar(false);
       return;
     }
 
+    if (dadosCarregados) salvarPosicao();
     enderecos = dados;
     dadosCarregados = true;
+    dataBase = new Date().toISOString();
 
-    mostrarRegioes();
-
-    if (regiaoAtual) {
-      atualizarQuadras();
-      mostrarResultados();
+    try {
+      localStorage.setItem(CACHE_KEY, JSON.stringify({
+        salvoEm: dataBase, registros: resposta.registros
+      }));
+    } catch (erro) {
+      // A consulta continua disponível se o navegador não permitir salvar a base.
     }
 
-    el("sourceStatus").textContent =
-      "✓ Atualizado pelo Google Sheets";
+    mostrarRegioes();
+    restaurarNavegacao();
+    const ignorados = resposta.registros.length - dados.length;
+    definirStatus(`Base recebida da planilha em ${formatarData(dataBase)}.` +
+      (ignorados ? ` ${ignorados} registro(s) incompleto(s) ignorado(s).` : ""));
 
     finalizar(true);
   };
@@ -1435,11 +1608,41 @@ function carregarEnderecos() {
   document.head.appendChild(script);
 }
 
+let dataBase = "";
+
+function formatarData(valor) {
+  return new Date(valor).toLocaleString("pt-BR");
+}
+
+function definirStatus(mensagem) {
+  el("dataMessage").textContent = mensagem;
+  el("sourceStatus").textContent = mensagem;
+}
+
+function carregarBaseSalva() {
+  try {
+    const cache = JSON.parse(localStorage.getItem(CACHE_KEY));
+    if (!cache || !Array.isArray(cache.registros) ||
+        !Number.isFinite(Date.parse(cache.salvoEm))) return;
+    const dados = cache.registros.map(converterLinha).filter(Boolean);
+    if (!dados.length) return;
+    enderecos = dados;
+    dadosCarregados = true;
+    dataBase = cache.salvoEm;
+  } catch (erro) {
+    // Cache ausente, inválido ou indisponível: consultar a planilha normalmente.
+  }
+}
+
+el("retryButton").onclick = carregarEnderecos;
+
 /* ==========================================
    INICIALIZAÇÃO
 ========================================== */
 
+carregarBaseSalva();
 mostrarRegioes();
+restaurarNavegacao();
 carregarEnderecos();
 
 </script>
